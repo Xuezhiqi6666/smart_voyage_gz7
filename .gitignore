@@ -142,3 +142,6 @@ milvus_redis_mysql/volumes/
 
 # Logs
 logs/
+
+# Claude AI
+.claude/
