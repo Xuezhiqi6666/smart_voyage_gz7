@@ -73,7 +73,8 @@ class Config:
 
         # 和风天气 API 配置
         self.test_api = "test_api"
-        self.weather_api_key = "dfd7d1516bb148e897644c2c88cc805b"
+        self.weather_api_key = "6e58606a7e9d4f36880aba348544b131"
+        # self.weather_api_key = "dfd7d1516bb148e897644c2c88cc805b"
         self.weather_api_host = "jv359h7m2j.re.qweatherapi.com"
         self.weather_base_url = f"https://{self.weather_api_host}/v7/weather/30d"
         self.weather_timezone = "Asia/Shanghai"

@@ -109,6 +109,6 @@ def execute_sql_file(sql_file_path: str):
 
 
 if __name__ == '__main__':
-    sql_path = "create_all_tables.sql"
-    # sql_path = "insert_data.sql"
+    # sql_path = "create_all_tables.sql"
+    sql_path = "insert_data.sql"
     execute_sql_file(sql_path)
