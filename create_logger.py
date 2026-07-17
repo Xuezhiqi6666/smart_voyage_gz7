@@ -14,6 +14,8 @@
 """
 import logging
 import os
+import sys
+import io
 
 from config import Config
 
@@ -31,8 +33,9 @@ def setup_logger(name, log_file='logs/app.log'):
     # 定义日志格式
     formatter = logging.Formatter('%(name)s - %(asctime)s - %(levelname)s - %(module)s %(lineno)d - %(message)s')
 
-    # 创建控制台处理器
-    console_handler = logging.StreamHandler()
+    # 创建控制台处理器（强制 UTF-8，解决 Windows GBK 中文乱码）
+    utf8_stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    console_handler = logging.StreamHandler(stream=utf8_stderr)
     console_handler.setFormatter(formatter)
     console_handler.setLevel(logging.INFO)  # 每个日志处理器可以单独设置日志级别，但是这个日志级别必须高于或等于处理器级别
 

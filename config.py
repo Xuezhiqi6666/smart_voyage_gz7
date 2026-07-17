@@ -57,7 +57,7 @@ class Config:
             "flight": "TicketAssistant", # 查票务-机票
             "train": "TicketAssistant", # 查票务-火车票
             "concert": "TicketAssistant", # 查票务-演唱会
-            "order": "TicketAssistant", # 查票务-查订单
+            "order": "TicketAssistant", # 订票务-查订单
             "car_rental": "TripAssistant", # 查旅行服务-租车
             "tour_group": "TripAssistant", # 查旅行服务-旅游团
             "insurance": "TripAssistant", # 查旅行服务-保险
