@@ -108,11 +108,9 @@ from python_a2a import A2AServer, run_server, AgentCard, AgentSkill, TaskStatus,
 # TaskState: 任务状态枚举（COMPLETED / FAILED / INPUT_REQUIRED）
 
 from langchain_openai import ChatOpenAI  # LangChain 的大模型接口
-from langchain_core.prompts import ChatPromptTemplate  # 提示模板
 from langchain_core.tools import StructuredTool  # 结构化 LangChain 工具
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-# create_tool_calling_agent: 创建基于工具调用的 Agent
-# AgentExecutor: Agent 执行器，负责运行 Agent 循环
+# LangChain 1.x: 用 create_agent 替代 langchain0.x 的 create_tool_calling_agent + AgentExecutor
+from langchain.agents import create_agent
 
 from datetime import datetime  # 时间处理
 import pytz  # 时区库
@@ -175,9 +173,12 @@ async def query_trip(conversation: str) -> dict:
     """
     try:
         tools = get_mcp_tools()
-        # 定义 Agent 的系统 Prompt
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """你是一个行程管家助手，能够调用工具来完成租车查询/预定、旅游团查询/报名、保险查询/购买。
+
+        # 获取当前日期，注入到 system prompt 中
+        current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
+
+        # LangGraph 1.x: system prompt 直接作为字符串传入
+        system_prompt = f"""你是一个行程管家助手，能够调用工具来完成租车查询/预定、旅游团查询/报名、保险查询/购买。
 你需要仔细分析用户的问题，从问题中提取工具需要的参数，然后调用对应的工具。
 如果用户提供的信息不足以提取到调用工具的所有必要参数，则向用户追问，以获取该信息。不能自己编撰参数。
 注意：
@@ -195,27 +196,18 @@ async def query_trip(conversation: str) -> dict:
 - 保险：保险类型: 名称XX，价格XX元/份，保障范围XX，保险公司XX
 预定成功后请直接告知用户预定结果。
 如果未查到数据，请回复"未找到相关行程数据，请确认或修改查询条件。"
-当前日期是{current_date}。"""),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
+当前日期是{current_date}。"""
 
-        # 创建基于工具调用的 Agent
-        agent = create_tool_calling_agent(llm, tools, prompt)
+        # LangChain 1.x: create_agent 替代 create_tool_calling_agent + AgentExecutor
+        agent = create_agent(llm, tools, system_prompt=system_prompt)
 
-        # 创建 Agent 执行器
-        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+        # LangGraph: 输入使用 messages 格式，输出从 messages[-1].content 获取
+        result = await agent.ainvoke(
+            {"messages": [("human", conversation)]},
+            config={"recursion_limit": 15}
+        )
 
-        # 获取当前日期，注入到 Prompt 中
-        current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
-
-        # 执行 Agent
-        response = await agent_executor.ainvoke({
-            "input": conversation,
-            "current_date": current_date
-        })
-
-        return {"status": "success", "message": response["output"]}
+        return {"status": "success", "message": result["messages"][-1].content}
 
     except ExceptionGroup as eg:
         # MCP 工具内部使用 anyio.create_task_group()，失败时抛出 ExceptionGroup

@@ -17,7 +17,7 @@
     ▼             ▼             ▼
 ┌────────┐  ┌────────┐  ┌────────┐
 │Weather │  │Ticket  │  │Trip    │   A2A 代理层
-│:5005   │  │:5006   │  │:5007   │   (LLM + 工具调用)
+│:5005   │  │:5006   │  │:5007   │   (LangChain 1.x create_agent)
 └───┬────┘  └───┬────┘  └───┬────┘
     │           │           │
     ▼           ▼           ▼
@@ -156,7 +156,7 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 | 组件 | 技术 |
 |------|------|
 | LLM | 通义千问 qwen3.7-max（DashScope API） |
-| 代理框架 | LangChain Agent + Tool Calling |
+| 代理框架 | LangChain 1.x `create_agent`（底层 LangGraph） |
 | 代理通信 | python_a2a（A2A 协议） |
 | 工具服务 | FastMCP（MCP 协议） |
 | 数据库 | MySQL 8.0（Docker，端口 3307） |
@@ -175,7 +175,7 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 ```
 
 - **API 层**：`api_server.py` + `chat_service.py`，负责接收用户输入、意图识别、任务规划、路由分发
-- **A2A 代理层**：3 个 Agent（Weather/Ticket/Trip），每个 Agent 内部用 **LangChain Agent + Tool Calling** 自主决策调用哪些工具
+- **A2A 代理层**：3 个 Agent（Weather/Ticket/Trip），每个 Agent 内部用 **LangChain 1.x `create_agent`**（底层 LangGraph 状态图）自主决策调用哪些工具
 - **MCP 工具层**：3 个 MCP Server，封装具体的数据库查询和 API 调用，通过 REST 接口暴露工具 Schema
 
 ### Q2：什么是 A2A 协议？和 MCP 有什么区别？
@@ -209,24 +209,37 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 
 ### Q5：ReAct 循环是怎么实现的？
 
-**A**：ReAct = **Re**asoning + **Act**ing。实现流程：
+**A**：ReAct = **Re**asoning + **Act**ing。本项目有两层 ReAct：
 
+**子代理层（A2A Server 内部）**：使用 LangChain 1.x 的 `create_agent`（底层是 LangGraph 的 `CompiledStateGraph`），自动实现 tool calling 循环：
+```
+model 节点 → 判断是否调用工具 → tools 节点执行工具 → 回到 model → ...直到 LLM 不再调用工具
+```
+通过 `recursion_limit` 控制最大迭代轮数，防止死循环。
+
+**主代理层（ChatService）**：
 1. **Planning Agent** 将复杂任务拆分为带依赖关系的步骤（`steps`）
 2. 按 `depends_on` 分组，**同组步骤并行执行**（`asyncio.gather`）
 3. 每组执行完后收集 `observations`，作为下一组的上下文
 4. 所有步骤完成后，LLM 汇总所有 observations 生成最终回复
 
-本项目优化：省略了传统 ReAct 中的 Thought 推理步骤（减少一次 LLM 调用），直接进入行动阶段。
-
 ### Q6：LangChain Agent 的 Tool Calling 是怎么工作的？
 
-**A**：`create_tool_calling_agent` + `AgentExecutor` 的工作流程：
+**A**：LangChain 1.x 使用 `create_agent`（底层是 LangGraph 状态图），工作流程：
 
-1. LLM 接收用户输入 + 工具列表（名称、描述、参数 Schema）
-2. LLM 判断需要调用哪个工具，输出 **function_call**（工具名 + 参数）
-3. AgentExecutor 执行工具调用，将结果作为 observation 返回给 LLM
-4. LLM 根据 observation 生成最终回复（或继续调用其他工具）
-5. 最多迭代 `max_iterations=5` 次，防止死循环
+1. LLM 接收用户输入（messages 格式）+ 工具列表（名称、描述、参数 Schema）
+2. LLM 判断需要调用哪个工具，输出 **tool_call**（工具名 + 参数）
+3. LangGraph 的 `tools` 节点自动执行工具调用，将结果作为 `ToolMessage` 返回
+4. `model` 节点根据 tool result 生成最终回复（或继续调用其他工具）
+5. 通过 `recursion_limit` 控制最大迭代轮数，防止死循环
+
+```python
+# LangChain 1.x 写法
+from langchain.agents import create_agent
+agent = create_agent(llm, tools, system_prompt="...")
+result = agent.invoke({"messages": [("human", query)]}, config={"recursion_limit": 15})
+output = result["messages"][-1].content
+```
 
 ### Q7：MCP 工具是怎么集成到 LangChain Agent 的？
 
@@ -235,7 +248,7 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 1. HTTP GET `/tools` 获取 MCP Server 的工具列表和 JSON Schema
 2. 将每个 MCP 工具转换为 LangChain 的 `StructuredTool`
 3. 工具的 `_func` 封装为 HTTP POST 到 `/tools/{tool_name}` 执行查询
-4. 转换后的工具传给 `create_tool_calling_agent` 使用
+4. 转换后的工具传给 `create_agent` 使用
 
 注意：带可选参数的 MCP 工具需要自定义转换（`to_structured_langchain_tool`），`python_a2a` 库自带的 `to_langchain_tool` 不支持可选参数。
 
@@ -271,7 +284,7 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 | A2A 调用阻塞 | `send_task_async` 实际是阻塞方法 | `run_in_executor` + `asyncio.run()` 包装 |
 | 子进程卡死 | stdout/stderr PIPE 缓冲区满 | stdout→DEVNULL，stderr 后台线程排空 |
 | MCP 工具重复获取 | 每次请求 HTTP GET /tools | `_cached_tools` 全局缓存，只获取一次 |
-| ReAct Thought 多余 | 每步额外一次 LLM 推理 | 省略 Thought，直接行动 |
+| ReAct Thought 多余 | 每步额外一次 LLM 推理 | 使用 `create_agent`（LangGraph），省略 Thought 直接行动 |
 
 ### Q11：如果让你继续优化这个项目，你会怎么做？
 
