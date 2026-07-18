@@ -1,11 +1,13 @@
 """
 需求：SmartVoyage FastAPI后端服务器，提供REST API接口
 """
+import asyncio
 import json
 import os
 import sys
 import subprocess
 import signal
+import threading
 import time
 import atexit
 import socket
@@ -49,10 +51,34 @@ async def chat(request: ChatRequest):
 
 
 async def sse_generator(message: str):
-    """SSE 生成器，逐字流式返回回复"""
-    async for chunk in chat_service.chat_stream(message):
-        # SSE 格式：每行以 "data: " 开头，用空行分隔
-        yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
+    """SSE 生成器，逐字流式返回回复，处理期间发送心跳保活"""
+    queue = asyncio.Queue()
+
+    async def producer():
+        """运行 chat_stream，将结果逐块放入队列"""
+        try:
+            async for text_chunk in chat_service.chat_stream(message):
+                await queue.put(text_chunk)
+        finally:
+            await queue.put(None)  # 结束信号
+
+    # 在后台运行 producer
+    producer_task = asyncio.create_task(producer())
+
+    while True:
+        try:
+            # 等待下一个 chunk，最多等 10 秒
+            chunk = await asyncio.wait_for(queue.get(), timeout=10)
+            if chunk is None:  # producer 完成
+                break
+            yield f"data: {json.dumps({'chunk': chunk}, ensure_ascii=False)}\n\n"
+        except asyncio.TimeoutError:
+            # 心跳：SSE 注释行（以 : 开头），客户端忽略但保持连接不断
+            yield ": heartbeat\n\n"
+
+    # 确保 producer 已完成
+    await producer_task
+
     # 发送结束标记
     yield "data: [DONE]\n\n"
 
@@ -107,6 +133,15 @@ _SUB_SERVICES = [
 ]
 
 
+def _drain_pipe(proc, name):
+    """后台线程：持续排空子进程的 stderr，防止管道缓冲区满导致子进程阻塞"""
+    try:
+        for line in proc.stderr:
+            pass  # 丢弃输出，防止管道堆积
+    except Exception:
+        pass  # 进程退出时 pipe 关闭，忽略异常
+
+
 def _start_sub_services():
     """启动所有子服务进程，先启动 MCP 工具层，再启动 A2A 代理层"""
     python_exe = sys.executable  # 使用当前 Python 解释器（与 conda 环境一致）
@@ -129,10 +164,12 @@ def _start_sub_services():
             proc = subprocess.Popen(
                 [python_exe, script_path],
                 cwd=_PROJECT_DIR,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 creationflags=creationflags,
             )
+            # 启动后台线程排空 stderr，防止管道缓冲区满导致子进程阻塞
+            threading.Thread(target=_drain_pipe, args=(proc, name), daemon=True).start()
             _SUB_PROCESSES.append((name, proc))
             print(f"  [启动] {name}  (PID: {proc.pid})")
         # MCP 层启动后等待一段时间，确保 A2A 层能连接到 MCP
@@ -148,18 +185,7 @@ def _start_sub_services():
         port = int(port_match.group(1)) if port_match else None
 
         if proc.poll() is not None:  # 进程已退出
-            # 读取 stderr 获取崩溃原因
-            _, stderr = proc.communicate()
-            error_msg = stderr.decode("utf-8", errors="replace").strip() if stderr else "无错误输出"
-            # 只保留最后几行（通常错误信息在末尾）
-            error_lines = error_msg.split("\n")[-5:]
-            error_brief = "\n".join(error_lines)
-            try:
-                print(f"  [失败] {name} (退出码: {proc.returncode})\n    错误信息:\n    {error_brief}")
-            except UnicodeEncodeError:
-                # Windows GBK 编码无法显示某些字符时，替换为安全字符
-                safe_brief = error_brief.encode('gbk', errors='replace').decode('gbk', errors='replace')
-                print(f"  [失败] {name} (退出码: {proc.returncode})\n    错误信息:\n    {safe_brief}")
+            print(f"  [失败] {name} (退出码: {proc.returncode})")
             failed.append(name)
         elif port:
             # 进程存活，检查端口是否就绪（最多重试 10 次，每次等 1 秒）

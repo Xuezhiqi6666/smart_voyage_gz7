@@ -163,3 +163,177 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 | 向量库 | Milvus（旅游团语义搜索） |
 | 天气数据 | 和风天气 API |
 | Web 框架 | FastAPI + Uvicorn |
+
+## 常见面试题
+
+### Q1：请介绍项目的整体架构
+
+**A**：SmartVoyage 采用 **三层架构**：
+
+```
+用户 → API 层（FastAPI :8080）→ A2A 代理层（LLM + 工具调用）→ MCP 工具层（数据库/API 查询）
+```
+
+- **API 层**：`api_server.py` + `chat_service.py`，负责接收用户输入、意图识别、任务规划、路由分发
+- **A2A 代理层**：3 个 Agent（Weather/Ticket/Trip），每个 Agent 内部用 **LangChain Agent + Tool Calling** 自主决策调用哪些工具
+- **MCP 工具层**：3 个 MCP Server，封装具体的数据库查询和 API 调用，通过 REST 接口暴露工具 Schema
+
+### Q2：什么是 A2A 协议？和 MCP 有什么区别？
+
+**A**：
+- **A2A（Agent-to-Agent）**：代理间通信协议，Agent 之间通过 HTTP POST（`/tasks/send`）传递 Task 对象，包含 Message、Status、Artifacts 等。用于 **Agent 之间的任务分发和协作**
+- **MCP（Model Context Protocol）**：工具服务协议，Server 通过 REST 接口（`/tools`、`/tools/{name}`）暴露工具 Schema 和执行入口。用于 **Agent 调用外部工具和数据源**
+
+简单说：**A2A 管 Agent 间通信，MCP 管 Agent 与工具的交互**。
+
+### Q3：意图识别是怎么做的？为什么不用传统的分类模型？
+
+**A**：用 **LLM 做意图识别**，Prompt 要求 LLM 返回 JSON 格式的结构化输出：
+
+```json
+{"intents": ["train"], "user_queries": {"train": "8月1日北京到成都"}, "follow_up_message": ""}
+```
+
+优势：
+1. **零样本泛化**：新增意图只需修改 Prompt，无需重新训练模型
+2. **同时提取参数**：LLM 在识别意图的同时提取查询参数（城市、日期等）
+3. **支持追问**：信息不足时 LLM 生成 `follow_up_message` 直接追问用户
+
+### Q4：什么是启发式路由？为什么要跳过规划？
+
+**A**：启发式路由是 `_should_skip_planning()` 方法，对**单意图或独立多意图**直接并行执行，跳过 Planning Agent 的 LLM 调用。
+
+原因：任务规划需要额外一次 LLM 调用（~15 秒），但大多数查询（如"查天气"、"查火车票"）是简单独立的，无需规划。启发式路由**节省一次 LLM 调用**，将响应时间从 ~40 秒降到 ~20 秒。
+
+只有**存在依赖关系的复杂任务**（如"查成都天气，再根据天气推荐景点"）才走 Planning Agent → ReAct 循环。
+
+### Q5：ReAct 循环是怎么实现的？
+
+**A**：ReAct = **Re**asoning + **Act**ing。实现流程：
+
+1. **Planning Agent** 将复杂任务拆分为带依赖关系的步骤（`steps`）
+2. 按 `depends_on` 分组，**同组步骤并行执行**（`asyncio.gather`）
+3. 每组执行完后收集 `observations`，作为下一组的上下文
+4. 所有步骤完成后，LLM 汇总所有 observations 生成最终回复
+
+本项目优化：省略了传统 ReAct 中的 Thought 推理步骤（减少一次 LLM 调用），直接进入行动阶段。
+
+### Q6：LangChain Agent 的 Tool Calling 是怎么工作的？
+
+**A**：`create_tool_calling_agent` + `AgentExecutor` 的工作流程：
+
+1. LLM 接收用户输入 + 工具列表（名称、描述、参数 Schema）
+2. LLM 判断需要调用哪个工具，输出 **function_call**（工具名 + 参数）
+3. AgentExecutor 执行工具调用，将结果作为 observation 返回给 LLM
+4. LLM 根据 observation 生成最终回复（或继续调用其他工具）
+5. 最多迭代 `max_iterations=5` 次，防止死循环
+
+### Q7：MCP 工具是怎么集成到 LangChain Agent 的？
+
+**A**：通过 `to_structured_langchain_tool()` 桥接函数：
+
+1. HTTP GET `/tools` 获取 MCP Server 的工具列表和 JSON Schema
+2. 将每个 MCP 工具转换为 LangChain 的 `StructuredTool`
+3. 工具的 `_func` 封装为 HTTP POST 到 `/tools/{tool_name}` 执行查询
+4. 转换后的工具传给 `create_tool_calling_agent` 使用
+
+注意：带可选参数的 MCP 工具需要自定义转换（`to_structured_langchain_tool`），`python_a2a` 库自带的 `to_langchain_tool` 不支持可选参数。
+
+### Q8：项目的记忆系统是怎么设计的？
+
+**A**：三层记忆，MySQL 持久化：
+
+| 记忆类型 | 存储 | 用途 |
+|---------|------|------|
+| 短期对话 | `short_term_messages` 表 | 多轮对话上下文传递（如"那边天气"→ 从上文推断城市） |
+| 用户偏好 | `user_profiles` 表 | UPSERT 模式，如 `seat_type: 二等座` 自动应用到后续查询 |
+| 实体历史 | 内存字典 | 提取查询中的城市、日期等实体，辅助意图理解 |
+
+### Q9：SSE 流式输出是怎么实现的？遇到过什么问题？
+
+**A**：前端通过 `POST /api/chat/stream` 发送请求，后端用 FastAPI 的 `StreamingResponse` + SSE 协议逐块返回。
+
+**遇到的问题**：`chat_stream` 内部的意图识别和 A2A 调用是同步阻塞的（~20 秒），期间无数据发送，导致客户端 Read Timeout。
+
+**解决方案**：Queue + 后台 Producer 模式：
+- Producer 在后台 Task 中运行 `chat_stream`，将结果放入 `asyncio.Queue`
+- 主循环从 Queue 取数据，取不到就每 10 秒发送 `: heartbeat` 心跳保活
+- 客户端收到心跳（SSE 注释行，自动忽略）保持连接不断
+
+### Q10：项目中遇到过哪些性能瓶颈？怎么优化的？
+
+**A**：
+
+| 瓶颈 | 原因 | 优化 |
+|------|------|------|
+| LLM 调用慢 | 单次 LLM 调用 ~14 秒 | 启发式路由跳过不必要的 Planning LLM 调用 |
+| 多意图串行 | 顺序执行多个意图 | `asyncio.gather` 并行执行独立意图 |
+| A2A 调用阻塞 | `send_task_async` 实际是阻塞方法 | `run_in_executor` + `asyncio.run()` 包装 |
+| 子进程卡死 | stdout/stderr PIPE 缓冲区满 | stdout→DEVNULL，stderr 后台线程排空 |
+| MCP 工具重复获取 | 每次请求 HTTP GET /tools | `_cached_tools` 全局缓存，只获取一次 |
+| ReAct Thought 多余 | 每步额外一次 LLM 推理 | 省略 Thought，直接行动 |
+
+### Q11：如果让你继续优化这个项目，你会怎么做？
+
+**A**：
+1. **工具结果缓存**：相同查询短时间内的 MCP 工具结果缓存（Redis），避免重复查数据库
+2. **流式 Tool Calling**：当前 A2A 代理等工具结果全部返回后才生成回复，可改为边查边输出
+3. **A2A 代理健康检查**：主服务定期 ping 子代理，故障时自动降级（返回友好提示而非超时等待）
+4. **意图识别优化**：用小模型（如 qwen-turbo）做意图分类，大模型只做最终回复生成，降低延迟和成本
+5. **多轮对话管理**：当前短期记忆无限增长，应增加滑动窗口或摘要压缩机制
+
+### Q12：查询火车票一直超时无响应，你是怎么排查和解决的？
+
+**A**：这是项目中最复杂的排查过程，涉及多个层面，最终定位到 **3 个叠加 bug**。
+
+**现象**：输入"8.1 北京到成都的火车票"，前端卡住 3 分钟无响应，后台日志显示 A2A 调用超时：
+```
+HTTPConnectionPool(host='127.0.0.1', port=5006): Read timed out. (read timeout=120)
+```
+
+**排查过程**（逐层排除）：
+
+| 排查步骤 | 怀疑点 | 验证方法 | 结论 |
+|---------|--------|---------|------|
+| ① MySQL 连接 | Docker 容器没启动？连接不上？ | 直接用 pymysql 查询 MySQL | 连接正常（0.031s），查询正常（0.001s），**排除** |
+| ② 连接池耗尽 | pool_size=5 不够？连接没归还？ | 检查 `_execute_query` 的 finally 块 | 有 `conn.close()` 归还连接，**排除** |
+| ③ MCP 工具调用 | MCP Server 8001 不响应？ | curl `http://127.0.0.1:8001/tools` | 工具列表正常返回，**排除** |
+| ④ LangChain Agent | Agent 执行太慢？ | 绕过 A2A，直接运行 `agent_executor.invoke()` | **13.2 秒完成**，Agent 本身没问题 |
+| ⑤ A2A HTTP 调用 | Flask Server 卡住？ | 单独启动 ticket_server，curl 测试 | 16.2 秒完成，**单独运行正常** |
+| ⑥ 子进程环境 | api_server.py 的子进程有问题？ | 对比单独运行 vs 子进程运行 | **定位到子进程才出问题** |
+
+**最终定位到 3 个叠加 bug**：
+
+**Bug 1：`send_task_async` 阻塞事件循环**
+```python
+# ❌ 错误写法：send_task_async 名字带 async 但实际是阻塞方法
+raw_response = await agent.send_task_async(task)  # 直接 await 会卡死事件循环
+
+# ✅ 正确写法：用 run_in_executor 包装（参考项目原始代码）
+raw_response = await asyncio.get_event_loop().run_in_executor(
+    None, lambda: asyncio.run(agent.send_task_async(task))
+)
+```
+原因：`python_a2a` 库的 `send_task_async` 内部使用 `requests`（同步 HTTP），并非真正的异步协程。直接 `await` 会阻塞整个事件循环。
+
+**Bug 2：子进程 PIPE 缓冲区满**
+```python
+# ❌ 错误写法：stdout/stderr 都 PIPE 但从不读取
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+# ✅ 正确写法：stdout 丢弃，stderr 后台线程排空
+proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+threading.Thread(target=_drain_pipe, args=(proc,), daemon=True).start()
+```
+原因：AgentExecutor 的 `verbose=True` 产生大量日志输出，PIPE 缓冲区（Windows ~4KB）被填满后，子进程在 `print()` 时阻塞挂起。
+
+**Bug 3：Docker 容器启动顺序**
+```
+正确顺序：docker compose up -d → python api_server.py（自动拉起 6 个子服务）
+```
+原因：api_server.py 启动子服务时，如果 MySQL/Milvus 容器未就绪，MCP 层连接失败，A2A 层查询超时。
+
+**经验总结**：
+- **名字带 async 不一定是真异步**：要查看底层实现，确认是否使用 `aiohttp`/`httpx` 等异步库
+- **subprocess PIPE 必须排空**：不读取的 PIPE 会导致子进程阻塞，生产环境应使用 DEVNULL 或日志文件
+- **分层排查法**：从底层（MySQL）→ 中间层（MCP）→ 上层（A2A）逐层验证，快速缩小问题范围

@@ -201,7 +201,7 @@ try:
     t0 = time.time()
     r = requests.post(f'{BASE}/api/chat/stream',
                       json={"message": "北京今天天气"},
-                      stream=True, timeout=120)
+                      stream=True, timeout=(10, 300))
     check('HTTP 200', r.status_code == 200)
     check('Content-Type SSE', 'event-stream' in r.headers.get('content-type', ''),
           f'实际: {r.headers.get("content-type")}')

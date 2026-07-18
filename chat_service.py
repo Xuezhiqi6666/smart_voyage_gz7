@@ -174,9 +174,9 @@ class ChatService:
         self.agent_network = AgentNetwork(name="旅行助手网络")
         # 向网络中注册子代理，使用自定义超时（120秒），避免子代理 LLM+MCP 调用链超时
         # 注意：调用链 = LLM选工具(5-15s) + MCP/MySQL(1-3s) + LLM格式化(5-15s)，总计可达 33s+
-        self.agent_network.add("WeatherAssistant", A2AClient("http://127.0.0.1:5005", timeout=300))
-        self.agent_network.add("TicketAssistant", A2AClient("http://127.0.0.1:5006", timeout=300))
-        self.agent_network.add("TripAssistant", A2AClient("http://127.0.0.1:5007", timeout=300))
+        self.agent_network.add("WeatherAssistant", A2AClient("http://127.0.0.1:5005", timeout=120))
+        self.agent_network.add("TicketAssistant", A2AClient("http://127.0.0.1:5006", timeout=120))
+        self.agent_network.add("TripAssistant", A2AClient("http://127.0.0.1:5007", timeout=120))
 
         # ========== 2. 初始化大模型连接 ==========
         # 使用 LangChain 的 ChatOpenAI 接口连接大模型
@@ -549,10 +549,12 @@ class ChatService:
             task = Task(id="task-" + str(uuid.uuid4()), message=msg.to_dict())
 
             # 通过 A2A 协议异步发送任务给子代理
-            # send_task_async 内部已使用 run_in_executor 处理阻塞调用，直接 await 即可
+            # send_task_async 实际是阻塞方法，需用 run_in_executor 包装避免阻塞事件循环
             try:
                 # 调用A2AServer执行任务
-                raw_response = await agent.send_task_async(task)
+                raw_response = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: asyncio.run(agent.send_task_async(task))
+                )
 
 
                 logger.info(f"{agent_name} 原始响应: {raw_response}")
@@ -957,9 +959,10 @@ class ChatService:
                 task = Task(id="task-" + str(uuid.uuid4()), message=msg.to_dict())
 
                 try:
-
-                    # 使用A2AServer来执行任务
-                    raw_response = await agent.send_task_async(task)
+                    # send_task_async 实际是阻塞方法，需用 run_in_executor 包装避免阻塞事件循环
+                    raw_response = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: asyncio.run(agent.send_task_async(task))
+                    )
 
                     logger.info(f"{agent_name} 原始响应: {raw_response}")
 
