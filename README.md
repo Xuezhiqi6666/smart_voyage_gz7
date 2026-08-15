@@ -186,7 +186,69 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 
 简单说：**A2A 管 Agent 间通信，MCP 管 Agent 与工具的交互**。
 
-### Q3：意图识别是怎么做的？为什么不用传统的分类模型？
+### Q3：为什么用 A2A 协议，而不用 LangGraph 编排？用 LangGraph 怎么实现？
+
+**A**：先澄清：**两者不是二选一，项目实际都用了**。A2A 是代理间**通信协议**（传输层），LangGraph 是进程内**编排框架**（执行层）。每个 A2A 子代理内部的 ReAct 循环就是用 LangChain 1.x `create_agent`（底层即 LangGraph 状态图，`recursion_limit=15`）实现的。
+
+**为什么 Agent 间通信用 A2A**：
+
+| 原因 | 说明 |
+|------|------|
+| 进程隔离 | 3 个子代理独立进程（:5005/:5006/:5007），故障域小，一个挂了不影响其他，可单独重启/排查 |
+| 协议标准 | AgentCard 自描述能力，子代理可用任意框架/语言实现，主助手零改动；LangGraph 节点共享 TypedDict State，跨框架复用难 |
+| 独立扩容 | 热点代理（如票务）只需把 AgentNetwork 的 URL 指向负载均衡，单独扩容 |
+| 代价可接受 | LLM 单次 ~14s，HTTP 开销可忽略；启发式路由后大多数请求只有 1 次 A2A 调用 |
+
+代价：HTTP 序列化开销 + 6 个子服务的运维复杂度。若低延迟单进程场景，全收进一个 LangGraph 图更简单。
+
+**用 LangGraph 的实现思路**（只换编排层，MCP 工具层和子代理的 `create_agent` 原样复用）：
+
+```python
+class VoyageState(TypedDict):
+    intents: list
+    user_queries: dict
+    observations: Annotated[list, add]   # reducer：并行分支结果自动合并
+
+# Send API 扇出并行分支，替代原方案的 asyncio.gather
+def route(state):
+    if should_skip_planning(state["intents"]):
+        return [Send("execute", {"intent": i, "query": state["user_queries"][i]})
+                for i in state["intents"]]
+    return "planner"
+
+graph.add_node("intent", intent_node)            # 意图识别节点
+graph.add_conditional_edges("intent", route)     # 启发式路由 = 条件边
+app = graph.compile(checkpointer=MemorySaver())  # thread_id 区分会话
+```
+
+| A2A 方案（本项目） | LangGraph 方案 |
+|------|------|
+| `asyncio.gather` 并行多意图 | `Send` API + reducer 合并 |
+| 自定义 `[追问]` / `INPUT_REQUIRED` | `interrupt()` 原生中断恢复 |
+| 自研 `memory.py` 短期记忆 | Checkpointer（`thread_id` 区分会话） |
+| HTTP 调子代理 | 进程内节点调用，LangSmith 全程可观测 |
+
+**一句话总结**：进程间协作用 A2A，进程内编排用 LangGraph；若是单进程场景，用 LangGraph Supervisor 图替换 A2A 通信层即可，MCP 工具层和子代理内部实现完全复用。
+
+**追问：有没有做分布式部署？主流的 A2A 项目怎么部署？**
+
+**A**：诚实说，目前是**单机多进程**部署——`api_server.py` 用 subprocess 拉起 6 个子服务，均绑定 127.0.0.1。但架构为分布式预留：Agent 间全部通过 HTTP + URL 寻址，业务代码无进程内共享状态。切分布式只需 3 步，业务代码零改动：
+
+1. 监听地址改 `run_server(host="0.0.0.0")`（127.0.0.1 其他机器无法访问）
+2. Agent URL 从硬编码外置到环境变量/配置中心
+3. 每个 Agent 容器化部署到 K8s，主服务 URL 指向集群内 DNS/负载均衡地址
+
+主流工程做法（A2A 为 Google 2025 年开源并捐赠 Linux 基金会的协议，设计理念是 **Agent-as-a-Service**）：
+
+| 实践 | 说明 |
+|------|------|
+| K8s 微服务 | 每个 Agent = Deployment + Service，HPA 对**单个 Agent** 独立扩缩容（LangGraph Platform 是整个图当一个服务部署，粒度更粗——这就是"独立扩容"优势的落地方式） |
+| 服务发现 | 官方协议通过 `/.well-known/agent-card.json` 暴露能力卡片；本项目用社区库 `python_a2a`，AgentCard 为手动注册 |
+| 网关统一入口 | 网关负责认证（OAuth2/API Key）、限流、路由，Agent 服务不直接暴露公网 |
+| 可观测性 | OpenTelemetry 串联 主Agent → 子Agent → MCP 调用链为分布式 trace |
+| 跨组织联邦 | A2A 独有价值：不同公司的 Agent 交换 AgentCard 即可互通，框架私有编排（如 LangGraph）做不到 |
+
+### Q4：意图识别是怎么做的？为什么不用传统的分类模型？
 
 **A**：用 **LLM 做意图识别**，Prompt 要求 LLM 返回 JSON 格式的结构化输出：
 
@@ -199,7 +261,7 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 2. **同时提取参数**：LLM 在识别意图的同时提取查询参数（城市、日期等）
 3. **支持追问**：信息不足时 LLM 生成 `follow_up_message` 直接追问用户
 
-### Q4：什么是启发式路由？为什么要跳过规划？
+### Q5：什么是启发式路由？为什么要跳过规划？
 
 **A**：启发式路由是 `_should_skip_planning()` 方法，对**单意图或独立多意图**直接并行执行，跳过 Planning Agent 的 LLM 调用。
 
@@ -207,7 +269,7 @@ curl -X POST http://127.0.0.1:8080/api/memory/profile \
 
 只有**存在依赖关系的复杂任务**（如"查成都天气，再根据天气推荐景点"）才走 Planning Agent → ReAct 循环。
 
-### Q5：ReAct 循环是怎么实现的？
+### Q6：ReAct 循环是怎么实现的？
 
 **A**：ReAct = **Re**asoning + **Act**ing。本项目有两层 ReAct：
 
@@ -223,7 +285,7 @@ model 节点 → 判断是否调用工具 → tools 节点执行工具 → 回�
 3. 每组执行完后收集 `observations`，作为下一组的上下文
 4. 所有步骤完成后，LLM 汇总所有 observations 生成最终回复
 
-### Q6：LangChain Agent 的 Tool Calling 是怎么工作的？
+### Q7：LangChain Agent 的 Tool Calling 是怎么工作的？
 
 **A**：LangChain 1.x 使用 `create_agent`（底层是 LangGraph 状态图），工作流程：
 
@@ -241,7 +303,7 @@ result = agent.invoke({"messages": [("human", query)]}, config={"recursion_limit
 output = result["messages"][-1].content
 ```
 
-### Q7：MCP 工具是怎么集成到 LangChain Agent 的？
+### Q8：MCP 工具是怎么集成到 LangChain Agent 的？
 
 **A**：通过 `to_structured_langchain_tool()` 桥接函数：
 
@@ -252,7 +314,7 @@ output = result["messages"][-1].content
 
 注意：带可选参数的 MCP 工具需要自定义转换（`to_structured_langchain_tool`），`python_a2a` 库自带的 `to_langchain_tool` 不支持可选参数。
 
-### Q8：项目的记忆系统是怎么设计的？
+### Q9：项目的记忆系统是怎么设计的？
 
 **A**：三层记忆，MySQL 持久化：
 
@@ -262,7 +324,7 @@ output = result["messages"][-1].content
 | 用户偏好 | `user_profiles` 表 | UPSERT 模式，如 `seat_type: 二等座` 自动应用到后续查询 |
 | 实体历史 | 内存字典 | 提取查询中的城市、日期等实体，辅助意图理解 |
 
-### Q9：SSE 流式输出是怎么实现的？遇到过什么问题？
+### Q10：SSE 流式输出是怎么实现的？遇到过什么问题？
 
 **A**：前端通过 `POST /api/chat/stream` 发送请求，后端用 FastAPI 的 `StreamingResponse` + SSE 协议逐块返回。
 
@@ -273,7 +335,7 @@ output = result["messages"][-1].content
 - 主循环从 Queue 取数据，取不到就每 10 秒发送 `: heartbeat` 心跳保活
 - 客户端收到心跳（SSE 注释行，自动忽略）保持连接不断
 
-### Q10：项目中遇到过哪些性能瓶颈？怎么优化的？
+### Q11：项目中遇到过哪些性能瓶颈？怎么优化的？
 
 **A**：
 
@@ -286,7 +348,7 @@ output = result["messages"][-1].content
 | MCP 工具重复获取 | 每次请求 HTTP GET /tools | `_cached_tools` 全局缓存，只获取一次 |
 | ReAct Thought 多余 | 每步额外一次 LLM 推理 | 使用 `create_agent`（LangGraph），省略 Thought 直接行动 |
 
-### Q11：如果让你继续优化这个项目，你会怎么做？
+### Q12：如果让你继续优化这个项目，你会怎么做？
 
 **A**：
 1. **工具结果缓存**：相同查询短时间内的 MCP 工具结果缓存（Redis），避免重复查数据库
@@ -295,7 +357,7 @@ output = result["messages"][-1].content
 4. **意图识别优化**：用小模型（如 qwen-turbo）做意图分类，大模型只做最终回复生成，降低延迟和成本
 5. **多轮对话管理**：当前短期记忆无限增长，应增加滑动窗口或摘要压缩机制
 
-### Q12：查询火车票一直超时无响应，你是怎么排查和解决的？
+### Q13：查询火车票一直超时无响应，你是怎么排查和解决的？
 
 **A**：这是项目中最复杂的排查过程，涉及多个层面，最终定位到 **3 个叠加 bug**。
 

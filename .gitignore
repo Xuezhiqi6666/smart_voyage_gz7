@@ -145,3 +145,6 @@ logs/
 
 # Claude AI
 .claude/
+
+# IDE
+.idea/

@@ -122,8 +122,11 @@ from python_a2a import A2AServer, run_server, AgentCard, AgentSkill, TaskStatus,
 
 
 from langchain_openai import ChatOpenAI  # LangChain 的大模型接口
-# LangChain 1.x: 用 create_agent 替代 langchain0.x 的 create_tool_calling_agent + AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate  # 提示模板
+# from langchain_mcp_adapters.tools import load_mcp_tools  # 从 MCP 会话加载工具
 from langchain.agents import create_agent
+# create_tool_calling_agent: 创建基于工具调用的 Agent
+# AgentExecutor: Agent 执行器，负责运行 Agent 循环
 
 from datetime import datetime  # 时间处理
 import pytz  # 时区库
@@ -235,11 +238,9 @@ class TicketServer(A2AServer):
         t0 = _time.time()
         tools = get_mcp_tools()
         logger.info(f"[计时] 获取MCP工具: {_time.time()-t0:.1f}s")
-        # 5.3 构建 system prompt（LangGraph 1.x: 直接字符串，不再需要 ChatPromptTemplate）
-        try:
-            current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
-
-            system_prompt = f"""你是一个票务预定和查询助手，能够调用工具来完成火车票、飞机票或演出票的预定和查询。
+        # 5.3 构建提示词模板(prompt)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """你是一个票务预定和查询助手，能够调用工具来完成火车票、飞机票或演出票的预定和查询。
 你需要仔细分析工具需要的参数，然后从用户提供的信息中提取参数值，再调用对应的查询或预定工具。
 如果用户提供的信息不足以提取到调用工具的所有必要参数，则向用户追问，以获取该信息。不能自己编撰参数。
 注意：
@@ -251,19 +252,22 @@ class TicketServer(A2AServer):
 - 【重要】当你需要向用户追问时，回复必须以"[追问]"开头，例如："[追问]请问您想查询哪一天的火车票？"
 查询到结果后，请用清晰的中文格式化输出票务信息，包括车次/航班/演出、日期、出发到达城市、座位/票档类型、价格等。
 如果未查到数据，请回复"未找到相关票务数据，请确认或修改查询条件。"
-当前日期是{current_date}。"""
+当前日期是{current_date}。"""),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+        # 5.4 构建Agent(tools + prompt + llm)
+        agent = create_tool_calling_agent(llm, tools, prompt)
+        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, max_iterations=5)
+        # 5.5 执行请求Agent的invoke
+        # 使用同步 invoke() 而非 asyncio.run(ainvoke())，避免 Flask 中创建新事件循环的开销
+        try:
+            current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
 
-            # 5.4 LangChain 1.x: create_agent 替代 create_tool_calling_agent + AgentExecutor
-            agent = create_agent(llm, tools, system_prompt=system_prompt)
-
-            # 5.5 执行 Agent（同步 invoke，Flask 环境中无需事件循环）
             t1 = _time.time()
-            result = agent.invoke(
-                {"messages": [("human", query)]},
-                config={"recursion_limit": 15}  # 限制最大迭代轮数（替代 max_iterations=5）
-            )
+            result = agent_executor.invoke({'input': query, 'current_date': current_date})
             logger.info(f"[计时] Agent执行完成: {_time.time()-t1:.1f}s")
-            output = result["messages"][-1].content
+            output = result['output']
             # 5.6 根据返回结果封装Task.Status和artifacts
             # 检查是否是追问消息（LLM 发现信息不足时会追问）
             # 判断优先级：[追问] 前缀（Prompt 约定）> 关键词兜底

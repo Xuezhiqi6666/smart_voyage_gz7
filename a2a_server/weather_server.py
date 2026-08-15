@@ -45,8 +45,11 @@ from python_a2a import A2AServer, run_server, AgentCard, AgentSkill, TaskStatus,
 # to_structured_langchain_tool: 从 MCP 服务器 URL 加载工具为带 Schema 的 LangChain StructuredTool
 
 from langchain_openai import ChatOpenAI  # LangChain 的大模型接口
-# LangChain 1.x: 用 create_agent 替代 langchain0.x 的 create_tool_calling_agent + AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate  # LangChain 的提示模板
+# langchain0.x 的写法，langchain1.x的写法是：create_agent
 from langchain.agents import create_agent
+# create_tool_calling_agent: 创建基于工具调用的 Agent
+# AgentExecutor: Agent 执行器，负责运行 Agent 循环
 
 import sys
 import os
@@ -140,11 +143,9 @@ async def query_weather(conversation: str) -> dict:
         # 从 MCP Server 加载所有可用工具（使用缓存，避免每次请求都重新获取）
         tools = get_mcp_tools()
 
-        # 获取当前日期，注入到 system prompt 中
-        current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
-
-        # LangGraph 1.x: system prompt 直接作为字符串传入，不再需要 ChatPromptTemplate
-        system_prompt = f"""你是一个天气查询助手，能够调用工具来查询天气信息。当前日期是 {current_date}。
+        # 定义 Agent 的系统 Prompt
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """你是一个天气查询助手，能够调用工具来查询天气信息。当前日期是 {current_date}。
 你需要仔细分析用户的问题，从问题中提取工具需要的参数（城市、日期等），然后调用对应的查询工具。
 如果用户提供的信息不足以提取到调用工具的所有必要参数，则向用户追问，以获取该信息。不能自己编撰参数。
 注意：
@@ -154,18 +155,27 @@ async def query_weather(conversation: str) -> dict:
 - 【重要】当你需要向用户追问时，回复必须以"[追问]"开头，例如："[追问]请问您想查询哪一天的天气？"
 查询到结果后，请用清晰的中文格式化输出天气信息，包括城市、日期、天气状况、温度、湿度、风向、降水量等。
 如果未查到数据，请回复"未找到相关天气数据，请确认或修改查询条件。"
-"""
+"""),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
 
-        # LangChain 1.x: create_agent 替代 create_tool_calling_agent + AgentExecutor
-        agent = create_agent(llm, tools, system_prompt=system_prompt)
+        # 创建基于工具调用的 Agent
+        agent = create_tool_calling_agent(llm, tools, prompt)
 
-        # LangGraph: 输入使用 messages 格式，输出从 messages[-1].content 获取
-        result = await agent.ainvoke(
-            {"messages": [("human", conversation)]},
-            config={"recursion_limit": 15}  # 限制最大迭代轮数（替代 AgentExecutor 的 max_iterations）
-        )
+        # 创建 Agent 执行器
+        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-        return {"status": "success", "message": result["messages"][-1].content}
+        # 获取当前日期，注入到 Prompt 中
+        current_date = datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d')
+
+        # 执行 Agent
+        response = await agent_executor.ainvoke({
+            "input": conversation,
+            "current_date": current_date
+        })
+
+        return {"status": "success", "message": response["output"]}
 
     except Exception as e:
         # MCP 连接失败、工具调用异常等情况的捕获

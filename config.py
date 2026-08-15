@@ -34,7 +34,7 @@ class Config:
 
         # 数据库配置
         self.host = 'localhost'
-        self.port = 3307  # 与 docker-compose.yml 的端口映射保持一致（宿主机 3307 → 容器 3306）
+        self.port = 3306  # 与 docker-compose.yml 的端口映射保持一致（宿主机 3307 → 容器 3306）
         # 业务账号由 docker-compose 的 MYSQL_USER/MYSQL_PASSWORD 自动创建，无需手动调用 ensure_mysql_user
         # TODO 实际工作中，一般一个业务创建一个账号。不要使用root，风险太大
         self.user = 'smart_voyage'
@@ -57,7 +57,7 @@ class Config:
             "flight": "TicketAssistant", # 查票务-机票
             "train": "TicketAssistant", # 查票务-火车票
             "concert": "TicketAssistant", # 查票务-演唱会
-            "order": "TicketAssistant", # 订票务-查订单
+            "order": "TicketAssistant", # 查票务-查订单
             "car_rental": "TripAssistant", # 查旅行服务-租车
             "tour_group": "TripAssistant", # 查旅行服务-旅游团
             "insurance": "TripAssistant", # 查旅行服务-保险
@@ -73,8 +73,7 @@ class Config:
 
         # 和风天气 API 配置
         self.test_api = "test_api"
-        self.weather_api_key = "6e58606a7e9d4f36880aba348544b131"
-        # self.weather_api_key = "dfd7d1516bb148e897644c2c88cc805b"
+        self.weather_api_key = "dfd7d1516bb148e897644c2c88cc805b"
         self.weather_api_host = "jv359h7m2j.re.qweatherapi.com"
         self.weather_base_url = f"https://{self.weather_api_host}/v7/weather/30d"
         self.weather_timezone = "Asia/Shanghai"
